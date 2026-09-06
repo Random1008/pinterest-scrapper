@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Téléchargements interrompus / en cours
+*.part
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environnements virtuels
+.venv/
+venv/

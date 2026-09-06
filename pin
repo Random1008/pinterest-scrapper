@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pin — télécharge les images d'un tableau Pinterest PUBLIC, ou en affiche le
+nombre. Zéro dépendance (bibliothèque standard uniquement), aucun compte.
+
+Usage :
+    pin -d <lien tableau> <dossier>    télécharge toutes les images du tableau
+                                       dans <dossier>
+    pin -s <lien tableau>              affiche le nombre d'images du tableau
+
+    <lien tableau> = https://www.pinterest.com/user/tableau/ (n'importe quel
+    pays : .fr, .de…) ou un lien court https://pin.it/XXXX
+
+Options :
+    --limit N      ne traiter que N épingles
+    --delay S      pause entre deux pages du flux (s)   [0.8]
+    --timeout S    timeout réseau en secondes           [60]
+
+Exemples :
+    pin -d https://pin.it/3SgF6mZX8 ~/Images/fonds
+    pin -s https://www.pinterest.fr/user/tableau/
+
+Principe :
+    Pinterest ne met plus les épingles dans le HTML des pages (rendu 100 %
+    JavaScript) : ce script reproduit les appels réseau que la page fait
+    elle-même (API interne Board / BoardFeed) et suit la pagination par
+    curseur « bookmark » — l'équivalent exact du défilement infini — puis
+    télécharge les images ORIGINALES (pleine résolution) de chaque épingle
+    (stories et carrousels inclus). Les épingles 100 % vidéo sont ignorées.
+
+    Tableaux publics uniquement. Usage personnel : respecter les CGU de
+    Pinterest et le droit d'auteur des images téléchargées.
+
+Sortie (-d) :
+    Un fichier par image : <id_epingle>_1.ext (image simple),
+    _p1,_p2… (pages d'une story), _c1,_c2… (diapos d'un carrousel).
+    Ré-exécution : fichiers déjà présents ignorés, doublons écartés.
+"""
+
+import gzip
+import json
+import random
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_ROOT = "https://www.pinterest.com"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+APP_VERSION = "a89153f"          # version d'app annoncée par la page web
+END_PREFIX = "Y2JOb25lO"         # bookmark de fin (base64 de "cbNone")
+EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+EXT_RE = re.compile(r"\.[A-Za-z0-9]{2,5}$")
+KIND_PREFIX = {"main": "", "story": "p", "carousel": "c"}
+
+USAGE = """\
+pin — images de tableaux Pinterest (publics)
+
+Usage :
+  pin -d <lien tableau> <dossier>     télécharge toutes les images dans <dossier>
+  pin -s <lien tableau>               affiche le nombre d'images du tableau
+
+Options :
+  --limit N     ne traiter que N épingles
+  --delay S     pause entre deux pages du flux (s)  [0.8]
+  --timeout S   timeout réseau en secondes          [60]
+
+Exemples :
+  pin -d https://pin.it/3SgF6mZX8 ~/Images/fonds
+  pin -s https://www.pinterest.fr/user/tableau/
+"""
+
+
+class PinterestError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Capture l'en-tête Location d'un 302 sans suivre la redirection."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_get(url, *, timeout=30, headers=None, follow_redirects=True,
+             decode_json=False, retries=3):
+    """GET avec en-têtes par défaut, décompression gzip et réessais."""
+    req_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers)
+    opener = urllib.request.build_opener() if follow_redirects \
+        else urllib.request.build_opener(NoRedirect())
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                data = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
+                return (resp.status, resp.headers, data) if not decode_json \
+                    else json.loads(data.decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt + 1 < retries:
+                time.sleep(2 ** (attempt + 1) + random.random())
+                continue
+            raise
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            last_err = e
+            if attempt + 1 < retries:
+                time.sleep(2 ** attempt + random.random())
+                continue
+            break
+    raise PinterestError(f"Erreur réseau: {last_err}")
+
+
+def http_download(url, dest: Path, *, timeout=60, retries=3):
+    """Télécharge un binaire vers dest (fichiers complets déjà présents sautés).
+
+    Renvoie 'downloaded', 'present' ou lève PinterestError."""
+    if dest.exists() and dest.stat().st_size > 0:
+        return "present"
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    req_headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": API_ROOT + "/",
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+    }
+    req = urllib.request.Request(url, headers=req_headers)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, \
+                    open(tmp, "wb") as fh:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            if tmp.stat().st_size == 0:
+                raise PinterestError("fichier vide")
+            tmp.replace(dest)
+            return "downloaded"
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (429, 500, 502, 503, 504) and attempt + 1 < retries:
+                time.sleep(2 ** (attempt + 1) + random.random())
+                continue
+            break
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            last_err = e
+            if attempt + 1 < retries:
+                time.sleep(2 ** attempt + random.random())
+                continue
+            break
+    tmp.unlink(missing_ok=True)
+    raise PinterestError(f"HTTP {getattr(last_err, 'code', '?')} — {url}")
+
+
+# --------------------------------------------------------------------------
+# API Pinterest (ressources internes appelées par la page web)
+# --------------------------------------------------------------------------
+
+class PinterestSession:
+    def __init__(self):
+        self.csrf = random.getrandbits(128).to_bytes(16, "big").hex()
+
+    def _headers(self):
+        return {
+            "Accept": "application/json, text/javascript, */*, q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-APP-VERSION": APP_VERSION,
+            "X-Pinterest-AppState": "active",
+            "X-Pinterest-PWS-Handler": "www/[username].js",
+            "Alt-Used": "www.pinterest.com",
+            "Cookie": f"csrftoken={self.csrf}",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+    def api(self, resource, options):
+        """Appelle <resource>Resource/get/ et renvoie le JSON complet."""
+        params = urllib.parse.urlencode({
+            "data": json.dumps({"options": options}, separators=(",", ":")),
+            "source_url": "",
+        })
+        url = f"{API_ROOT}/resource/{resource}Resource/get/?{params}"
+        try:
+            return http_get(url, headers=self._headers(), decode_json=True)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            raise PinterestError(f"API {resource} -> HTTP {e.code}: {body}")
+
+    def board(self, user, slug):
+        """Infos du tableau (id, nom, nb d'épingles, sections…)."""
+        data = self.api("Board", {
+            "slug": slug, "username": user, "field_set_key": "detailed",
+        })
+        board = data.get("resource_response", {}).get("data") or {}
+        if not board:
+            raise PinterestError(f"Tableau /{user}/{slug} non accessible "
+                                 f"(privé, renommé ou supprimé)")
+        return board
+
+    def iter_pins(self, resource, options, pause):
+        """Générateur paginé d'épingles (BoardFeed, BoardSectionPins…)."""
+        while True:
+            resp = self.api(resource, options)
+            data = (resp.get("resource_response") or {}).get("data")
+            pins = data if isinstance(data, list) \
+                else (data or {}).get("results", [])
+            for pin in pins:
+                yield pin
+            bm = self._next_bookmark(resp)
+            if bm is None:
+                return
+            options["bookmarks"] = bm
+            time.sleep(pause)
+
+    @staticmethod
+    def _next_bookmark(resp):
+        """Curseur de page suivante, quelle que soit sa forme (liste/dict/str)."""
+        bm = (((resp.get("resource") or {}).get("options")) or {}) \
+            .get("bookmarks")
+        if isinstance(bm, dict):
+            bm = bm.get("next") or bm.get("bookmarks") or []
+        if isinstance(bm, str):
+            bm = [bm]
+        if not isinstance(bm, list) or not bm:
+            return None
+        if bm[0] == "-end-" or bm[0].startswith(END_PREFIX):
+            return None
+        return bm
+
+    def board_pins(self, board_id, pause):
+        yield from self.iter_pins("BoardFeed", {
+            "board_id": board_id,
+            "field_set_key": "react_grid_pin",
+            "prepend": False,
+            "bookmarks": None,
+        }, pause)
+
+    def sections(self, board_id, pause):
+        yield from self.iter_pins("BoardSections", {
+            "board_id": board_id,
+            "field_set_key": "react_grid_sections",
+        }, pause)
+
+    def section_pins(self, section_id, pause):
+        yield from self.iter_pins("BoardSectionPins", {
+            "section_id": section_id,
+            "field_set_key": "react_grid_pin",
+            "bookmarks": None,
+        }, pause)
+
+
+def resolve_short_link(url):
+    """Résout un lien court https://pin.it/<code> vers l'URL réelle (302)."""
+    m = re.search(r"pin\.it/([A-Za-z0-9_-]+)", url)
+    if not m:
+        return url
+    target = f"https://api.pinterest.com/url_shortener/{m.group(1)}/redirect/"
+    try:
+        status, headers, _ = http_get(target, follow_redirects=False)
+    except urllib.error.HTTPError as e:
+        status, headers = e.code, e.headers
+    location = headers.get("Location") if headers else None
+    if status in (301, 302) and location:
+        return location
+    raise PinterestError(f"Impossible de résoudre le lien court {url}")
+
+
+def parse_board_url(url):
+    """Extrait (user, slug) d'une URL ...pinterest.<tld>/user/board/."""
+    m = re.search(r"pinterest\.[a-z.]+/([^/?#]+)/([^/?#]+)", url, re.IGNORECASE)
+    if not m:
+        raise PinterestError(
+            "URL non reconnue. Forme attendue : "
+            "https://www.pinterest.com/utilisateur/tableau/ (lien pin.it accepté)")
+    user = urllib.parse.unquote(m.group(1))
+    slug = urllib.parse.unquote(m.group(2))
+    if user.lower() == "pin":
+        raise PinterestError("C'est l'URL d'une épingle unique, pas d'un tableau.")
+    if slug.lower() in ("pins", "_saved", "_created"):
+        raise PinterestError(
+            f"'{slug}' est une vue de profil, pas un tableau. "
+            "Donnez l'URL d'un tableau : /utilisateur/nom-du-tableau/")
+    return user, slug
+
+
+# --------------------------------------------------------------------------
+# Extraction des médias d'une épingle
+# --------------------------------------------------------------------------
+
+def ordered_urls(images_map):
+    """URLs d'un dict {taille: {url,width,height}}, de la meilleure à la moins
+    bonne : originale d'abord, puis tailles décroissantes."""
+    if not isinstance(images_map, dict):
+        return []
+    urls = []
+    for key in ("originals", "orig"):
+        url = (images_map.get(key) or {}).get("url")
+        if url:
+            urls.append(url)
+    rest = []
+    for key, entry in images_map.items():
+        if not isinstance(entry, dict) or not entry.get("url"):
+            continue
+        if entry["url"] in urls:
+            continue
+        rest.append((entry.get("width") or 0, key, entry["url"]))
+    rest.sort(reverse=True)                 # largeur décroissante
+    urls += [u for _, _, u in rest]
+    return urls
+
+
+def pin_media(pin):
+    """Images d'une épingle : liste de (type, [URLs par qualité décroissante]).
+
+    type = 'main' (image simple), 'story' (page d'idée pin) ou
+    'carousel' (diapo). Une épingle 100 % vidéo renvoie [].
+    """
+    out = []
+
+    story = pin.get("story_pin_data")
+    if story:
+        for page in story.get("pages", []):
+            for block in page.get("blocks", []):
+                if "image" not in block:
+                    continue            # bloc texte/musique/vidéo
+                urls = ordered_urls(((block.get("image") or {}).get("images")))
+                if urls:
+                    out.append(("story", urls))
+        if out:
+            return out
+        urls = ordered_urls(pin.get("images"))   # repli : la couverture
+        return [("story", urls)] if urls else []
+
+    carousel = pin.get("carousel_data")
+    if carousel:
+        for slot in carousel.get("carousel_slots", []):
+            urls = ordered_urls(slot.get("images"))
+            if urls:
+                out.append(("carousel", urls))
+        return out
+
+    if pin.get("videos"):
+        return []                       # épingle 100 % vidéo
+
+    urls = ordered_urls(pin.get("images"))
+    return [("main", urls)] if urls else []
+
+
+# --------------------------------------------------------------------------
+# Flux d'épingles d'un tableau (flux principal + sections éventuelles)
+# --------------------------------------------------------------------------
+
+def board_pin_stream(session, board, opts):
+    """Épingles du tableau, sans doublon d'id, jusqu'à --limit."""
+    seen = set()
+    count = 0
+    for pin in session.board_pins(board["id"], opts["delay"]):
+        if pin.get("id") in seen:
+            continue
+        seen.add(pin["id"])
+        count += 1
+        if opts["limit"] and count > opts["limit"]:
+            return
+        yield pin
+    if board.get("section_count") and (not opts["limit"] or count < opts["limit"]):
+        for section in session.sections(board["id"], opts["delay"]):
+            for pin in session.section_pins(section.get("id"), opts["delay"]):
+                if pin.get("id") in seen:
+                    continue
+                seen.add(pin["id"])
+                count += 1
+                if opts["limit"] and count > opts["limit"]:
+                    return
+                yield pin
+
+
+# --------------------------------------------------------------------------
+# Modes d'utilisation
+# --------------------------------------------------------------------------
+
+def extension_variants(url):
+    """URLs candidates pour un même fichier : l'URL d'origine, puis le même
+    chemin avec les autres extensions (un original « .jpg » peut n'être servi
+    qu'en .png, par ex.)."""
+    m = EXT_RE.search(url)
+    base = url[:m.start()] if m else url
+    first = url if m else base + ".jpg"
+    out = [first]
+    for ext in EXTS:
+        cand = base + ext
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def cmd_download(session, url, dest, opts):
+    """pin -d : télécharge toutes les images du tableau dans dest."""
+    real = resolve_short_link(url)
+    user, slug = parse_board_url(real)
+    outdir = Path(dest).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Tableau /{user}/{slug} → {outdir}")
+    board = session.board(user, slug)
+    name = board.get("name") or slug
+    pin_count = board.get("pin_count")
+    print(f"« {name} »" + (f" — {pin_count} épingle(s) annoncée(s)" if pin_count else ""))
+
+    seen_urls = set()
+    stats = {"images": 0, "existing": 0, "dupes": 0, "video": 0,
+             "noimage": 0, "errors": 0}
+
+    try:
+        stream = board_pin_stream(session, board, opts)
+        for pin in stream:
+            pid = str(pin.get("id", "?"))
+            media = pin_media(pin)
+            if not media:
+                stats["video" if pin.get("videos") else "noimage"] += 1
+                continue
+            desc = (pin.get("description") or "").strip().replace("\n", " ")
+            label = f"épingle {pid}"
+            if desc:
+                label += f" — {desc[:70]}"
+            counters = {}
+            for kind, urls in media:
+                counters[kind] = counters.get(kind, 0) + 1
+                prefix = KIND_PREFIX[kind]
+                stem = f"{pid}_1" if not prefix \
+                    else f"{pid}_{prefix}{counters[kind]}"
+                best = urls[0] if urls else None
+                if best in seen_urls:
+                    stats["dupes"] += 1     # même image déjà enregistrée
+                    continue
+                saved = False
+                for u in urls:
+                    if u in seen_urls or saved:
+                        continue
+                    for cand in extension_variants(u):
+                        m = EXT_RE.search(cand)
+                        ext = m.group(0) if m else ".jpg"
+                        dest_file = outdir / (stem + ext)
+                        try:
+                            status = http_download(cand, dest_file,
+                                                   timeout=opts["timeout"])
+                        except Exception:
+                            continue        # extension / taille suivante
+                        seen_urls.add(cand)
+                        if status == "downloaded":
+                            stats["images"] += 1
+                            print(f"↓ {dest_file.name}")
+                        else:
+                            stats["existing"] += 1
+                        saved = True
+                        break
+                if not saved:
+                    stats["errors"] += 1
+                    print(f"[ERREUR] épingle {pid}: aucune variante "
+                          f"téléchargeable ({urls[0]})", file=sys.stderr)
+            if len(media) > 1:
+                print(label)
+    except PinterestError as e:
+        print(f"[ATTENTION] flux interrompu: {e}", file=sys.stderr)
+
+    print(f"{stats['images']} téléchargée(s), {stats['existing']} déjà "
+          f"présentes, {stats['dupes']} doublon(s) écarté(s), "
+          f"{stats['video']} vidéo(s) ignorée(s)")
+    if stats["errors"]:
+        print(f"{stats['errors']} image(s) en échec", file=sys.stderr)
+    return 0 if not stats["errors"] else 1
+
+
+def cmd_stats(session, url, opts):
+    """pin -s : affiche le nombre d'images du tableau."""
+    real = resolve_short_link(url)
+    user, slug = parse_board_url(real)
+    board = session.board(user, slug)
+    name = board.get("name") or slug
+
+    n_pins = n_images = n_video = n_noimage = 0
+    try:
+        for pin in board_pin_stream(session, board, opts):
+            n_pins += 1
+            media = pin_media(pin)
+            if not media:
+                n_video += 1 if pin.get("videos") else 0
+                n_noimage += 0 if pin.get("videos") else 1
+                continue
+            n_images += len(media)
+    except PinterestError as e:
+        print(f"[ATTENTION] flux interrompu: {e}", file=sys.stderr)
+
+    if opts["limit"]:
+        print(f"Tableau « {name} » (/{user}/{slug}): {n_images} image(s) "
+              f"sur {n_pins} épingle(s) analysées (limite {opts['limit']})")
+    else:
+        print(f"Tableau « {name} » (/{user}/{slug}): {n_images} image(s) — "
+              f"{n_pins} épingle(s), dont {n_video} vidéo(s) et "
+              f"{n_noimage} sans image")
+    return 0
+
+
+def parse_opts(argv):
+    """Options --limit/--delay/--timeout présentes dans argv (mutées)."""
+    opts = {"limit": 0, "delay": 0.8, "timeout": 60}
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--limit", "--delay", "--timeout"):
+            if i + 1 >= len(argv):
+                raise PinterestError(f"option {a} : valeur manquante")
+            val = argv[i + 1]
+            try:
+                if a == "--limit":
+                    opts["limit"] = int(val)
+                elif a == "--delay":
+                    opts["delay"] = float(val)
+                else:
+                    opts["timeout"] = int(val)
+            except ValueError:
+                raise PinterestError(f"option {a} : valeur invalide « {val} »")
+            i += 2
+        else:
+            rest.append(a)
+            i += 1
+    return opts, rest
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0 if argv else 2
+
+    cmd = argv[0]
+    if cmd not in ("-d", "-s"):
+        print(f"Commande inconnue : {cmd}\n", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    try:
+        opts, rest = parse_opts(argv[1:])
+    except PinterestError as e:
+        print(f"pin: {e}", file=sys.stderr)
+        return 2
+
+    if cmd == "-d":
+        if len(rest) < 2:
+            print("pin -d attend : <lien tableau> <dossier>\n", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            return 2
+        session = PinterestSession()
+        try:
+            return cmd_download(session, rest[0], rest[1], opts)
+        except PinterestError as e:
+            print(f"pin: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nInterrompu.", file=sys.stderr)
+            return 130
+    else:  # -s
+        if len(rest) < 1:
+            print("pin -s attend : <lien tableau>\n", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            return 2
+        session = PinterestSession()
+        try:
+            return cmd_stats(session, rest[0], opts)
+        except PinterestError as e:
+            print(f"pin: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nInterrompu.", file=sys.stderr)
+            return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
